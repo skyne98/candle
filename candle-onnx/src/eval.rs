@@ -1950,6 +1950,89 @@ fn simple_eval_(
                 let output = input.sign()?;
                 values.insert(node.output[0].clone(), output);
             }
+            // https://onnx.ai/onnx/operators/onnx__LayerNormalization.html
+            "LayerNormalization" => {
+                /*
+                Mean = ReduceMean<axes=normalized_axes>(X)
+                D = Sub(X, Mean)
+                DD = Mul(D, D)
+                Var = ReduceMean<axes=normalized_axes>(DD)
+                VarEps = Add(Var, epsilon)
+                StdDev = Sqrt(VarEps)
+                InvStdDev = Reciprocal(StdDev)
+                Normalized = Mul(D, InvStdDev)
+                */
+                /*
+                NormalizedScaled = Mul(Normalized, Scale)
+                Y = Add(NormalizedScaled, B)
+                */
+
+                let input = get(&node.input[0])?;
+                let scale = get(&node.input[1])?;
+                let bias = if node.input.len() > 2 {
+                    Some(get(&node.input[2])?)
+                } else {
+                    None
+                };
+
+                let axis = get_attr_opt::<i64>(node, "axis")?.copied().unwrap_or(-1);
+                let epsilon = get_attr_opt::<f32>(node, "epsilon")?
+                    .copied()
+                    .unwrap_or(1e-5);
+                let stash_type = get_attr_opt::<i64>(node, "stash_type")?
+                    .copied()
+                    .unwrap_or(1);
+
+                // Convert negative axis to positive
+                let axis = if axis < 0 {
+                    (input.rank() as i64 + axis) as usize
+                } else {
+                    axis as usize
+                };
+
+                // Calculate the axes for reduction (from axis to end)
+                let normalized_axes: Vec<usize> = (axis..input.rank()).collect();
+
+                // First stage: Standardization (cast to f32 if stash_type == 1)
+                let x = if stash_type == 1 {
+                    input.to_dtype(DType::F32)?
+                } else {
+                    input.clone()
+                };
+
+                let mean = x.mean_keepdim(normalized_axes.clone())?;
+                let d = x.broadcast_sub(&mean)?;
+                let dd = d.sqr()?;
+                let var = dd.mean_keepdim(normalized_axes)?;
+                let var_eps = var.broadcast_add(&Tensor::new(epsilon as f32, var.device())?)?;
+                let std_dev = var_eps.sqrt()?;
+                let inv_std_dev = std_dev.recip()?;
+                let normalized = d.broadcast_mul(&inv_std_dev)?;
+
+                // Convert back to original type if necessary
+                let normalized = if stash_type == 1 {
+                    normalized.to_dtype(input.dtype())?
+                } else {
+                    normalized
+                };
+
+                // Second stage: Scale and shift
+                let normalized_scaled = normalized.broadcast_mul(scale)?;
+                let output = match bias {
+                    Some(b) => normalized_scaled.broadcast_add(b)?,
+                    None => normalized_scaled,
+                };
+
+                values.insert(node.output[0].clone(), output);
+
+                // Optional outputs
+                if node.output.len() > 1 {
+                    values.insert(node.output[1].clone(), mean);
+                }
+                if node.output.len() > 2 {
+                    values.insert(node.output[2].clone(), inv_std_dev);
+                }
+            }
             op_type => bail!("unsupported op_type {op_type} for op {node:?}"),
         }
     }
